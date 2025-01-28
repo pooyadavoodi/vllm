@@ -318,7 +318,13 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         sequences are provided."""
         start_time = time.perf_counter()
 
+        start_time = time.perf_counter()
         inputs = self.prepare_input(execute_model_req)
+        end_time = time.perf_counter()
+        logger.debug(
+            "prepare_input: %.0f ms",
+            (end_time - start_time) * 1000,
+        )
         if inputs is None:
             return None
 

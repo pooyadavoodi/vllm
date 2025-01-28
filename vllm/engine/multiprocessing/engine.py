@@ -180,6 +180,7 @@ class MQLLMEngine:
 
     def run_engine_loop(self):
         """Core busy loop of the LLMEngine."""
+        import time
 
         while True:
             if not self.engine.has_unfinished_requests():
@@ -192,10 +193,21 @@ class MQLLMEngine:
                     logger.debug("Waiting for new requests in engine loop.")
 
             # Handle any input from the client.
+            start_time = time.perf_counter()
             self.handle_new_input()
+            end_time = time.perf_counter()
+            logger.debug(
+                "run_engine_loop.handle_new_input: %.0f ms",
+                (end_time - start_time) * 1000,
+            )
 
             # Engine step.
+            start_time = time.perf_counter()
             request_outputs = self.engine_step()
+            end_time = time.perf_counter()
+            logger.debug(
+                "run_engine_loop.engine_step: %.0f ms", (end_time - start_time) * 1000
+            )
 
             # Send request outputs (if async, done in engine_step callback).
             if not self.use_async_sockets:

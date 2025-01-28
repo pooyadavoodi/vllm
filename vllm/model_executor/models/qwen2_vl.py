@@ -69,6 +69,7 @@ from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper,
                     init_vllm_registered_model, maybe_prefix)
 from .vision import get_vit_attn_backend
+import time
 
 logger = init_logger(__name__)
 
@@ -591,26 +592,69 @@ class Qwen2VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        start_start_time = time.perf_counter()
+
+        start_time = time.perf_counter()
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
+        end_time = time.perf_counter()
+        logger.debug(
+            "Qwen2VisionTransformer.patchify: %.0f ms",
+            (end_time - start_time) * 1000,
+        )
+        logger.debug("Qwen2VisionTransformer.patchify_output: %s", x.shape)
 
+        start_time = time.perf_counter()
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        end_time = time.perf_counter()
+        logger.debug(
+            "Qwen2VisionTransformer.position_embedding: %.0f ms",
+            (end_time - start_time) * 1000,
+        )
 
+        start_time = time.perf_counter()
         # compute cu_seqlens
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
                                              grid_thw[:, 0]).cumsum(
                                                  dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        end_time = time.perf_counter()
+        logger.debug(
+            "Qwen2VisionTransformer.cu_seqlens: %.0f ms",
+            (end_time - start_time) * 1000,
+        )
 
         # transformers
         x = x.unsqueeze(1)
-        for blk in self.blocks:
+        for i, blk in enumerate(self.blocks):
+            start_time = time.perf_counter()
             x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+            logger.debug("Qwen2VisionTransformer.blk(%d)_output: %s", i, x.shape)
+            end_time = time.perf_counter()
+            logger.debug(
+                "Qwen2VisionTransformer.blk(%d): %.0f ms",
+                i,
+                (end_time - start_time) * 1000,
+            )
 
+        start_time = time.perf_counter()
         # adapter
         x = self.merger(x)
+        logger.debug("Qwen2VisionTransformer.merger_output: %s", x.shape)
+        end_time = time.perf_counter()
+        logger.debug(
+            "Qwen2VisionTransformer.adapter: %.0f ms",
+            (end_time - start_time) * 1000,
+        )
+
+        end_time = time.perf_counter()
+        logger.debug(
+            "Qwen2VisionTransformer.forward: %.0f ms",
+            (end_time - start_start_time) * 1000,
+        )
+
         return x
 
     def load_weights(self, weights: Iterable[Tuple[str,
@@ -636,8 +680,7 @@ class Qwen2VisionTransformer(nn.Module):
                 break
             else:
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
@@ -1119,6 +1162,14 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
 
+        logger.debug(
+            "Qwen2VLImageInputs: pixel_values=%s, image_embeds=%s, "
+            "image_grid_thw=%s",
+            pixel_values.shape if pixel_values is not None else None,
+            image_embeds.shape if image_embeds is not None else None,
+            image_grid_thw,
+        )
+
         if pixel_values is None and image_embeds is None:
             return None
 
@@ -1218,7 +1269,40 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
     def get_multimodal_embeddings(
             self, **kwargs) -> Optional[List[Tuple[NestedTensors, str]]]:
 
+        # class Qwen2VLImagePixelInputs(TypedDict):
+        #     type: Literal["pixel_values"]
+        #     pixel_values: torch.Tensor
+        #     """Shape:
+        #     `(num_patches, num_channels * patch_size * patch_size)`
+        #     """
+
+        #     image_grid_thw: torch.Tensor
+        #     """Shape: `(num_images, 3)`
+        #     This should be in `(grid_t, grid_h, grid_w)` format.
+        #     """
+
+        # class Qwen2VLImageEmbeddingInputs(TypedDict):
+        #     type: Literal["image_embeds"]
+        #     image_embeds: torch.Tensor
+        #     """Supported types:
+        #     - List[`torch.Tensor`]: A list of tensors holding all images' features.
+        #         Each tensor holds an image's features.
+        #     - `torch.Tensor`: A tensor holding all images' features
+        #         (concatenation of all images' feature tensors).
+
+        #     Tensor shape: `(num_image_features, hidden_size)`
+        #     - `num_image_features` varies based on
+        #         the number and resolution of the images.
+        #     - `hidden_size` must match the hidden size of language model backbone.
+        #     """
+
+        #     image_grid_thw: torch.Tensor
+        #     """Shape: `(num_images, 3)`
+        #     This should be in `(grid_t, grid_h, grid_w)` format.
+        #     """
+
         image_input = self._parse_and_validate_image_input(**kwargs)
+        logger.debug("image_input: %s", image_input)
         video_input = self._parse_and_validate_video_input(**kwargs)
         if image_input is None and video_input is None:
             return None
@@ -1300,7 +1384,19 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         # NOTE: In v1, inputs_embeds is always generated at model runner, this
         # condition is for v0 compatibility.
         elif inputs_embeds is None:
+            start_time = time.perf_counter()
             multimodal_embeddings = self.get_multimodal_embeddings(**kwargs)
+            end_time = time.perf_counter()
+            logger.debug(
+                "Qwen2VL.forward.get_multimodal_embeddings %.0f ms",
+                (end_time - start_time) * 1000,
+            )
+            if multimodal_embeddings:
+                logger.debug(
+                    "number of multimodal_embeddings: %d", len(multimodal_embeddings)
+                )
+                for embeddings, modality in multimodal_embeddings:
+                    logger.debug("shape: %s", embeddings.shape)
 
             # We need to check for usage of mrope here in case there is
             # multimodal data.
@@ -1310,10 +1406,18 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}")
 
+            start_time = time.perf_counter()
             inputs_embeds = self.get_input_embeddings(input_ids,
                                                       multimodal_embeddings)
+            end_time = time.perf_counter()
+            logger.debug(
+                "Qwen2VL.forward.get_input_embeddings %.0f ms",
+                (end_time - start_time) * 1000,
+            )
+            logger.debug("inputs_embeds.shape: %s", inputs_embeds.shape)
             input_ids = None
 
+        start_time = time.perf_counter()
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
@@ -1321,6 +1425,11 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             attn_metadata=attn_metadata,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
+        )
+        end_time = time.perf_counter()
+        logger.debug(
+            "Qwen2VL.forward.model %.0f ms",
+            (end_time - start_time) * 1000,
         )
         return hidden_states
 

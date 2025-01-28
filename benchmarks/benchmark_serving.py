@@ -277,9 +277,9 @@ def sample_hf_requests(
                            name=dataset_subset,
                            split=dataset_split,
                            streaming=True)
-    assert "conversations" in dataset.features, (
-        "HF Dataset must have 'conversations' column.")
-    filter_func = lambda x: len(x["conversations"]) >= 2
+    assert "question" in dataset.features, (
+        "HF Dataset must have 'question' column.")
+    filter_func = lambda x: len(x["question"]) >= 2
     filtered_dataset = dataset.shuffle(seed=random_seed).filter(filter_func)
     sampled_requests: List[Tuple[str, int, int, Dict[str,
                                                      Collection[str]]]] = []
@@ -288,10 +288,13 @@ def sample_hf_requests(
             break
 
         # Tokenize the prompts and completions.
-        prompt = data["conversations"][0]["value"]
+        print(f"data['question']: {data['question']}")
+        # prompt = data["question"][0]["value"]
+        prompt = data["question"]
         prompt_token_ids = tokenizer(prompt).input_ids
-        completion = data["conversations"][1]["value"]
-        completion_token_ids = tokenizer(completion).input_ids
+        # completion = data["question"][1]["value"]
+        # completion_token_ids = tokenizer(completion).input_ids
+        completion_token_ids = []
         prompt_len = len(prompt_token_ids)
         output_len = len(completion_token_ids
                          ) if fixed_output_len is None else fixed_output_len

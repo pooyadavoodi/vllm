@@ -1007,12 +1007,16 @@ class LLMEngine:
         ctx: The virtual engine context to work on
         request_id: If provided, then only this request is going to be processed
         """
+        start_time = time.time()
 
         now = time.time()
 
         if len(ctx.output_queue) == 0:
-            return None
-
+            end_time = time.time()
+            logger.debug(
+                "_process_model_outputs: %.0f ms", (end_time - start_time) * 1000
+            )
+            return
         # Get pending async postprocessor
         if request_id:
             # When we process only one request, no pop is required
@@ -1056,6 +1060,10 @@ class LLMEngine:
             # this is a new request that has no pending async
             # postprocessor
             if not indices:
+                end_time = time.time()
+                logger.debug(
+                    "_process_model_outputs: %.0f ms", (end_time - start_time) * 1000
+                )
                 return
         else:
             indices = range(len(seq_group_metadata_list))  # type: ignore
@@ -1143,6 +1151,10 @@ class LLMEngine:
                     and self.process_request_outputs_callback is not None):
                 self.process_request_outputs_callback(ctx.request_outputs)
                 ctx.request_outputs.clear()
+            end_time = time.time()
+            logger.debug(
+                "_process_model_outputs: %.0f ms", (end_time - start_time) * 1000
+            )
             return
 
         # Free currently finished requests
@@ -1157,6 +1169,10 @@ class LLMEngine:
                     and self.process_request_outputs_callback is not None):
                 self.process_request_outputs_callback(ctx.request_outputs)
                 ctx.request_outputs.clear()
+            end_time = time.time()
+            logger.debug(
+                "_process_model_outputs: %.0f ms", (end_time - start_time) * 1000
+            )
             return
 
         # Create the outputs
@@ -1183,6 +1199,10 @@ class LLMEngine:
             if self.process_request_outputs_callback is not None:
                 self.process_request_outputs_callback(ctx.request_outputs)
                 ctx.request_outputs.clear()
+            end_time = time.time()
+            logger.debug(
+                "_process_model_outputs: %.0f ms", (end_time - start_time) * 1000
+            )
             return
 
         for seq_group in scheduler_outputs.ignored_seq_groups:
@@ -1216,6 +1236,8 @@ class LLMEngine:
             # Tracing
             self.do_tracing(scheduler_outputs, finished_before)
 
+        end_time = time.time()
+        logger.debug("_process_model_outputs: %.0f ms", (end_time - start_time) * 1000)
         return None
 
     def _advance_to_next_step(
@@ -1388,11 +1410,23 @@ class LLMEngine:
                 last_sampled_token_ids=last_sampled_token_ids)
 
             if allow_async_output_proc:
+                start_time = time.time()
                 execute_model_req.async_callback = self.async_callbacks[
                     virtual_engine]
+                end_time = time.time()
+                logger.debug(
+                    "LLMEngine.step.async_callbacks: %.0f ms",
+                    (end_time - start_time) * 1000,
+                )
 
+            start_time = time.time()
             outputs = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
+            end_time = time.time()
+            logger.debug(
+                "LLMEngine.step.execute_model: %.0f ms",
+                (end_time - start_time) * 1000,
+            )
 
             # We need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.

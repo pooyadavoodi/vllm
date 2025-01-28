@@ -511,6 +511,35 @@ def run_qwen2_vl(question: str, modality: str):
     return llm, prompt, stop_token_ids
 
 
+def run_qwen2_vl_72b_fp8(question: str, modality: str):
+
+    model_name = "nm-testing/Qwen2-VL-72B-Instruct-FP8-dynamic"
+
+    llm = LLM(
+        model=model_name,
+        # max_model_len=4096,
+        # max_num_seqs=5,
+        # Note - mm_processor_kwargs can also be passed to generate/chat calls
+        # mm_processor_kwargs={
+        #     "min_pixels": 1920 * 1080,
+        #     "max_pixels": 1920 * 1080,
+        # },
+        disable_mm_preprocessor_cache=args.disable_mm_preprocessor_cache,
+        # limit_mm_per_prompt = {"image": 16},
+    )
+
+    if modality == "image":
+        placeholder = "<|image_pad|>"
+    elif modality == "video":
+        placeholder = "<|video_pad|>"
+
+    prompt = ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+              f"<|im_start|>user\n<|vision_start|>{placeholder}<|vision_end|>"
+              f"{question}<|im_end|>\n"
+              "<|im_start|>assistant\n")
+    stop_token_ids = None
+    return llm, prompt, stop_token_ids
+
 model_example_map = {
     "aria": run_aria,
     "blip-2": run_blip2,
@@ -536,7 +565,21 @@ model_example_map = {
     "pixtral_hf": run_pixtral_hf,
     "qwen_vl": run_qwen_vl,
     "qwen2_vl": run_qwen2_vl,
+    "qwen2_vl_72b_fp8": run_qwen2_vl_72b_fp8,
 }
+
+def encode_image(image):
+    import base64
+    import io
+    from PIL import ImageOps
+
+    buf = io.BytesIO()
+
+    image_size_limit = (1920, 1080)
+    ImageOps.contain(image.convert("RGB"), image_size_limit).save(
+        buf, format="JPEG"
+    )
+    return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode('ascii')}"
 
 
 def get_multi_modal_input(args):
@@ -547,9 +590,11 @@ def get_multi_modal_input(args):
     }
     """
     if args.modality == "image":
-        # Input image and question
-        image = ImageAsset("cherry_blossom") \
-            .pil_image.convert("RGB")
+        image = ImageAsset("cherry_blossom")
+        image = encode_image(image.pil_image)
+        # # Input image and question
+        # image = ImageAsset("cherry_blossom") \
+        #     .pil_image.convert("RGB")
         img_question = "What is the content of this image?"
 
         return {
@@ -615,8 +660,8 @@ def main(args):
 
     # We set temperature to 0.2 so that outputs can be different
     # even when all prompts are identical when running batch inference.
-    sampling_params = SamplingParams(temperature=0.2,
-                                     max_tokens=64,
+    sampling_params = SamplingParams(temperature=0.0,
+                                     max_tokens=1,
                                      stop_token_ids=stop_token_ids)
 
     assert args.num_prompts > 0
@@ -644,6 +689,9 @@ def main(args):
                     modality: data
                 },
             } for _ in range(args.num_prompts)]
+
+    print(f"inputs: {len(inputs)}")
+
 
     if args.time_generate:
         import time
