@@ -322,7 +322,9 @@ class Qwen2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        logger.debug(f"input_ids.shape: %s", input_ids.shape if input_ids else "")
+        logger.debug(
+            f"input_ids.shape: %s", input_ids.shape if input_ids is not None else ""
+        )
         logger.debug(
             f"inputs_embeds.shape: %s",
             inputs_embeds.shape if inputs_embeds is not None else "",
