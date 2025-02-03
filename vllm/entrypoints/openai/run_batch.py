@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import tempfile
 from http import HTTPStatus
-from io import StringIO
 from typing import Awaitable, Callable, List, Optional
 
 import aiohttp
@@ -134,17 +134,48 @@ async def read_file(path_or_url: str) -> str:
             return f.read()
 
 
-async def write_file(path_or_url: str, data: str) -> None:
+async def write_local_file(output_path: str,
+                           responses: List[BatchRequestOutput]) -> None:
+    """
+    Write the responses to a local file.
+    output_path: The path to write the responses to.
+    responses: The list of responses to write.
+    """
+    # We should make this async, but as long as run_batch runs as a
+    # standalone program, blocking the event loop won't effect performance.
+    with open(output_path, "w", encoding="utf-8") as f:
+        for response in responses:
+            print(response.model_dump_json(), file=f)
+
+
+async def upload_file(output_url: str, local_data_filepath: str) -> None:
+    """
+    Upload a local file to a URL.
+    output_url: The URL to upload the file to.
+    local_data_filepath: The path to the local file to upload.
+    """
+    async with aiohttp.ClientSession() as session:
+        with open(local_data_filepath, encoding="utf-8") as f:
+            async with session.put(output_url, data=f) as response:
+                if response.status != 200:
+                    raise Exception(
+                        f"Failed to upload file: {response.status}")
+
+
+async def write_file(path_or_url: str,
+                     responses: List[BatchRequestOutput]) -> None:
+    """
+    Write the responses to a file or upload to a URL.
+    path_or_url: The path or URL to write the responses to.
+    responses: The list of responses to write.
+    """
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
-        async with aiohttp.ClientSession() as session, \
-                   session.put(path_or_url, data=data.encode("utf-8")):
-            pass
+        # Write responses to a temporary file and then upload it to the URL.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as f:
+            await write_local_file(f.name, responses)
+            await upload_file(path_or_url, f.name)
     else:
-        # We should make this async, but as long as this is always run as a
-        # standalone program, blocking the event loop won't effect performance
-        # in this particular case.
-        with open(path_or_url, "w", encoding="utf-8") as f:
-            f.write(data)
+        await write_local_file(path_or_url, responses)
 
 
 def make_error_request_output(request: BatchRequestInput,
@@ -317,12 +348,8 @@ async def main(args):
     with tracker.pbar():
         responses = await asyncio.gather(*response_futures)
 
-    output_buffer = StringIO()
-    for response in responses:
-        print(response.model_dump_json(), file=output_buffer)
-
-    output_buffer.seek(0)
-    await write_file(args.output_file, output_buffer.read().strip())
+    logger.info("Writing batch outputs to %s...", args.output_file)
+    await write_file(args.output_file, responses)
 
 
 if __name__ == "__main__":
