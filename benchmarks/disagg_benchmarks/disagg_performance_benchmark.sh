@@ -14,6 +14,11 @@
 
 set -ex
 
+export VLLM_USE_V1=0
+
+export HF_TOKEN="hf_"
+export MODEL=""
+
 kill_gpu_processes() {
   # kill all processes on GPU.
   pgrep pt_main_thread | xargs -r kill -9
@@ -34,49 +39,55 @@ wait_for_server() {
 
 
 launch_chunked_prefill() {
-  model="meta-llama/Meta-Llama-3.1-8B-Instruct"
   # disagg prefill
-  CUDA_VISIBLE_DEVICES=0 python3 \
+  python3 \
     -m vllm.entrypoints.openai.api_server \
-    --model $model \
-    --port 8100 \
-    --max-model-len 10000 \
+    --model $MODEL \
+    --port 8000 \
+    --max-model-len 15000 \
     --enable-chunked-prefill \
-    --gpu-memory-utilization 0.6 &
-  CUDA_VISIBLE_DEVICES=1 python3 \
-    -m vllm.entrypoints.openai.api_server \
-    --model $model \
-    --port 8200 \
-    --max-model-len 10000 \
-    --enable-chunked-prefill \
-    --gpu-memory-utilization 0.6 &
-  wait_for_server 8100
-  wait_for_server 8200
-  python3 round_robin_proxy.py &
+    --tensor-parallel-size 2 \
+    --disable-log-requests    \
+    --gpu-memory-utilization 0.7 &
+  # CUDA_VISIBLE_DEVICES=1 python3 \
+  #   -m vllm.entrypoints.openai.api_server \
+  #   --model $MODEL \
+  #   --port 8200 \
+  #   --max-model-len 50000 \
+  #   --enable-chunked-prefill \
+  #   --gpu-memory-utilization 0.8 &
+  wait_for_server 8000
+  # wait_for_server 8200
+  # python3 round_robin_proxy.py &
   sleep 1
 }
 
 
 launch_disagg_prefill() {
-  model="meta-llama/Meta-Llama-3.1-8B-Instruct" 
   # disagg prefill
   CUDA_VISIBLE_DEVICES=0 python3 \
     -m vllm.entrypoints.openai.api_server \
-    --model $model \
+    --model $MODEL \
     --port 8100 \
-    --max-model-len 10000 \
-    --gpu-memory-utilization 0.6 \
+    --max-model-len 15000 \
+    --gpu-memory-utilization 0.7 \
+    --enable-chunked-prefill=False \
+    --disable-log-requests \
     --kv-transfer-config \
-    '{"kv_connector":"PyNcclConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":5e9}' &
+    '{"kv_connector":"PyNcclConnector","kv_role":"kv_producer","kv_rank":0,"kv_parallel_size":2,"kv_buffer_size":15e9}' &
+
+    # --max-num-batched-tokens 8192 \
 
   CUDA_VISIBLE_DEVICES=1 python3 \
     -m vllm.entrypoints.openai.api_server \
-    --model $model \
+    --model $MODEL \
     --port 8200 \
-    --max-model-len 10000 \
-    --gpu-memory-utilization 0.6 \
+    --max-model-len 15000 \
+    --gpu-memory-utilization 0.7 \
+    --enable-chunked-prefill=False \
+    --disable-log-requests    \
     --kv-transfer-config \
-    '{"kv_connector":"PyNcclConnector","kv_role":"kv_consumer","kv_rank":1,"kv_parallel_size":2,"kv_buffer_size":5e9}' &
+    '{"kv_connector":"PyNcclConnector","kv_role":"kv_consumer","kv_rank":1,"kv_parallel_size":2,"kv_buffer_size":15e9}' &
 
   wait_for_server 8100
   wait_for_server 8200
@@ -87,30 +98,33 @@ launch_disagg_prefill() {
 
 benchmark() {
   results_folder="./results"
-  model="meta-llama/Meta-Llama-3.1-8B-Instruct"
-  dataset_name="sonnet"
-  dataset_path="../sonnet_4x.txt"
-  num_prompts=100
-  qps=$1
-  prefix_len=50
-  input_len=1024
-  output_len=$2
+  dataset_name="random"
+  # dataset_path="../sonnet_4x.txt"
+  num_prompts=50
+  # qps=$1
+  # prefix_len=50
+  input_len=2048
+  output_len=11
   tag=$3
 
   python3 ../benchmark_serving.py \
           --backend vllm \
-          --model $model \
+          --model $MODEL \
           --dataset-name $dataset_name \
-          --dataset-path $dataset_path \
-          --sonnet-input-len $input_len \
-          --sonnet-output-len "$output_len" \
-          --sonnet-prefix-len $prefix_len \
+          --random-input-len $input_len \
+          --random-output-len "$output_len" \
           --num-prompts $num_prompts \
           --port 8000 \
           --save-result \
           --result-dir $results_folder \
-          --result-filename "$tag"-qps-"$qps".json \
-          --request-rate "$qps"
+          --result-filename "$tag"-"$input_len"-"$output_len".json \
+          --request-rate 2 \
+          --ignore-eos
+
+          # --dataset-path $dataset_path \
+          # --sonnet-input-len $input_len \
+          # --sonnet-output-len "$output_len" \
+          # --sonnet-prefix-len $prefix_len \
 
   sleep 2
 }
@@ -144,18 +158,18 @@ main() {
   export VLLM_HOST_IP=$(hostname -I | awk '{print $1}')
 
   launch_chunked_prefill
-  for qps in 2 4 6 8; do
+  for qps in 4; do
   benchmark $qps $default_output_len chunked_prefill
   done
   kill_gpu_processes
 
   launch_disagg_prefill
-  for qps in 2 4 6 8; do
+  for qps in 4; do
   benchmark $qps $default_output_len disagg_prefill
   done
   kill_gpu_processes
 
-  python3 visualize_benchmark_results.py
+  # python3 visualize_benchmark_results.py
 
 }
 
