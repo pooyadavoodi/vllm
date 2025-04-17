@@ -84,6 +84,7 @@ class Proxy:
         self.router.post("/instances/add",
                          dependencies=[Depends(self.api_key_authenticate)
                                        ])(self.add_instance_endpoint)
+        self.router.get("/metrics")(self.get_metrics)
 
     async def validate_json_request(self, raw_request: Request):
         content_type = raw_request.headers.get("content-type", "").lower()
@@ -248,6 +249,26 @@ class Proxy:
         }
         return status
 
+    async def get_metrics(self):
+        # forward the request to the first prefill instance using forward_request
+        if self.prefill_instances:
+            prefill_instance = self.schedule(self.prefill_cycler)
+            url = f"http://{prefill_instance}/metrics"
+            try:
+                async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            content = await response.text()
+                            return StreamingResponse(
+                                content=content, media_type="text/plain"
+                            )
+                        else:
+                            raise HTTPException(
+                                status_code=500, detail="Failed to get metrics."
+                            )
+            except aiohttp.ClientError as e:
+                raise HTTPException(status_code=500, detail=str(e)) from e
+
     async def create_completion(self, raw_request: Request):
         try:
             request = await raw_request.json()
@@ -409,7 +430,7 @@ class ProxyServer:
     def run_server(self):
         app = FastAPI()
         app.include_router(self.proxy_instance.router)
-        config = uvicorn.Config(app, port=self.port, loop="uvloop")
+        config = uvicorn.Config(app, host="0.0.0.0", port=self.port, loop="uvloop")
         server = uvicorn.Server(config)
         server.run()
 
