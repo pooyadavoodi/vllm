@@ -608,3 +608,39 @@ def test_top_p(rejection_sampler, top_p):
         unmasked_indices=top_p_indices,
         sampling_metadata=sampling_metadata,
     )
+
+
+@pytest.mark.parametrize("frequency_penalty", [0.05, 0.5])
+def test_frequency_penalty(rejection_sampler, frequency_penalty):
+    """Test rejection sampling with frequency_penalty sampling"""
+    vocab_size = 100
+    batch_size = 100
+    num_draft_tokens = 3
+    num_tokens = batch_size * num_draft_tokens
+
+    # Create logits with the uniform distribution.
+    target_logits = torch.zeros((num_tokens, vocab_size), device=DEVICE)
+
+    # Increment the logits for top-k indices, a little bit more than the other
+    # ones. If the masking is effective, the non-topk indices will never be
+    # sampled despite the small difference in logits.
+    for i in range(num_tokens):
+        target_logits[i, top_k_indices[i]] += 0.1
+
+    # Create sampling metadata
+    temperature = torch.ones(batch_size, dtype=torch.float32, device=DEVICE)
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=temperature,
+        top_k=torch.tensor([top_k] * batch_size, device=DEVICE, dtype=torch.int64),
+    )
+
+    _test_masked_logits(
+        rejection_sampler,
+        batch_size=batch_size,
+        num_draft_tokens=num_draft_tokens,
+        vocab_size=vocab_size,
+        target_logits=target_logits,
+        unmasked_indices=top_k_indices,
+        sampling_metadata=sampling_metadata,
+    )

@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.sample.ops.penalties import apply_all_penalties
 
 logger = init_logger(__name__)
 
@@ -289,6 +290,19 @@ def compute_probs(
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
     logits = apply_top_k_top_p(logits, top_k, top_p)
+
+    # Apply penalties
+    if not sampling_metadata.no_penalties:
+        assert sampling_metadata.prompt_token_ids is not None
+        logits = apply_all_penalties(
+            logits,
+            sampling_metadata.prompt_token_ids,
+            sampling_metadata.presence_penalties,
+            sampling_metadata.frequency_penalties,
+            sampling_metadata.repetition_penalties,
+            sampling_metadata.output_token_ids,
+        )
+
     output_prob = logits.softmax(dim=-1, dtype=torch.float32)
     return output_prob
 
