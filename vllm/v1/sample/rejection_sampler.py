@@ -7,10 +7,11 @@ import triton
 import triton.language as tl
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.utils import apply_penalties
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.penalties import _convert_to_tensors
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.sample.ops.penalties import apply_all_penalties
 
 logger = init_logger(__name__)
 
@@ -294,13 +295,45 @@ def compute_probs(
     # Apply penalties
     if not sampling_metadata.no_penalties:
         assert sampling_metadata.prompt_token_ids is not None
-        logits = apply_all_penalties(
-            logits,
+
+        prompt_token_ids = expand_batch_to_tokens(
             sampling_metadata.prompt_token_ids,
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+
+        _, vocab_size = logits.shape
+        output_tokens_t = _convert_to_tensors(
+            sampling_metadata.output_token_ids, vocab_size, logits.device)
+        output_tokens_t = expand_batch_to_tokens(
+            output_tokens_t,
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+
+        presence_penalties = expand_batch_to_tokens(
             sampling_metadata.presence_penalties,
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+        frequency_penalties = expand_batch_to_tokens(
             sampling_metadata.frequency_penalties,
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+        repetition_penalties = expand_batch_to_tokens(
             sampling_metadata.repetition_penalties,
-            sampling_metadata.output_token_ids,
+            cu_num_draft_tokens,
+            num_tokens,
+        )
+
+        logits = apply_penalties(
+            logits,
+            prompt_token_ids,
+            output_tokens_t,
+            presence_penalties,
+            frequency_penalties,
+            repetition_penalties,
         )
 
     output_prob = logits.softmax(dim=-1, dtype=torch.float32)
@@ -333,18 +366,39 @@ def expand_batch_to_tokens(
     Returns:
         expanded_x: [num_tokens] tensor.
     """
-    batch_size = x.shape[0]
-    assert cu_num_tokens.shape[0] == batch_size
-    expanded_x = x.new_empty(num_tokens)
-    expand_kernel[(batch_size, )](
-        expanded_x,
-        x,
-        cu_num_tokens,
-        replace_from,
-        replace_to,
-        MAX_NUM_TOKENS=MAX_SPEC_LEN,  # To avoid recompilation.
-        num_warps=1,
-    )
+    if x.ndim == 1:
+        batch_size = x.shape[0]
+        assert cu_num_tokens.shape[0] == batch_size
+        expanded_x = x.new_empty(num_tokens)
+
+        expand_kernel[(batch_size, )](
+            expanded_x,
+            x,
+            cu_num_tokens,
+            replace_from,
+            replace_to,
+            MAX_NUM_TOKENS=MAX_SPEC_LEN,  # To avoid recompilation.
+            num_warps=1,
+        )
+    elif x.ndim == 2:
+        batch_size, vocab_size = x.shape
+        assert cu_num_tokens.shape[0] == batch_size
+        expanded_x = x.new_empty((num_tokens, vocab_size))
+
+        expand_kernel_2d[(batch_size, vocab_size)](
+            expanded_x,
+            x,
+            cu_num_tokens,
+            replace_from,
+            replace_to,
+            MAX_NUM_TOKENS=MAX_SPEC_LEN,
+            VOCAB_SIZE=vocab_size,
+            num_warps=4 if vocab_size > 512 else 1,
+        )
+    else:
+        raise ValueError(
+            f"Invalid input tensor shape: {x.shape}. Expected 1D or 2D tensor."
+        )
     return expanded_x
 
 
@@ -577,6 +631,43 @@ def expand_kernel(
     tl.store(output_ptr + start_idx + offset,
              src_val,
              mask=offset < num_tokens)
+
+
+@triton.jit(do_not_specialize=["replace_from", "replace_to"])
+def expand_kernel_2d(
+    output_ptr,  # [num_tokens, vocab_size]
+    input_ptr,  # [batch_size, vocab_size]
+    cu_num_tokens_ptr,  # [batch_size]
+    replace_from,
+    replace_to,
+    MAX_NUM_TOKENS: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+):
+    # 2D launch grid: batch x vocab
+    req_idx = tl.program_id(0)
+    vocab_idx = tl.program_id(1)
+
+    # Calculate sequence boundaries
+    if req_idx == 0:  # noqa: SIM108
+        start_idx = 0
+    else:
+        start_idx = tl.load(cu_num_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_tokens_ptr + req_idx)
+    num_tokens = end_idx - start_idx
+
+    # Load and process value
+    input_offset = req_idx * VOCAB_SIZE + vocab_idx
+    src_val = tl.load(input_ptr + input_offset)
+    src_val = tl.where(src_val == replace_from, replace_to, src_val)
+
+    # Calculate output positions
+    token_offsets = tl.arange(0, MAX_NUM_TOKENS)
+    output_offsets = (start_idx + token_offsets) * VOCAB_SIZE + vocab_idx
+
+    # Vectorized store with mask
+    tl.store(output_ptr + output_offsets,
+             src_val,
+             mask=token_offsets < num_tokens)
 
 
 @triton.jit
