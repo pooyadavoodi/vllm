@@ -327,6 +327,7 @@ def compute_probs(
             num_tokens,
         )
 
+        # Apply penalties to logits.
         logits = apply_penalties(
             logits,
             prompt_token_ids,

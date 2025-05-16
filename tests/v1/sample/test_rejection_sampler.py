@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.v1.sample.utils import create_weighted_output_token_list
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (PLACEHOLDER_TOKEN_ID,
                                               RejectionSampler)
@@ -20,7 +21,7 @@ def rejection_sampler():
 
 def create_logits_tensor(output_token_ids: list[list[int]],
                          vocab_size: int = 100) -> torch.Tensor:
-    """Helper function to create logits tensor that 
+    """Helper function to create logits tensor that
        will produce desired token ids on argmax"""
     token_ids = [tokens[:-1] for tokens in output_token_ids]
     num_total_tokens = sum(len(tokens) for tokens in token_ids)
@@ -38,10 +39,13 @@ def create_sampling_metadata(
     temperature: Optional[torch.Tensor] = None,
     top_k: Optional[torch.Tensor] = None,
     top_p: Optional[torch.Tensor] = None,
+    frequency_penalties: Optional[torch.Tensor] = None,
     generators: Optional[dict[int, Any]] = None,
+    prompt_token_ids: Optional[torch.Tensor] = None,
+    output_token_ids: Optional[list[list[int]]] = None,
 ) -> SamplingMetadata:
-    """Create a v1 sampling metadata object with all_greedy set 
-        to the given value. Either all greedy or all random sampling 
+    """Create a v1 sampling metadata object with all_greedy set
+        to the given value. Either all greedy or all random sampling
         is used.
     """
     generators = generators or {}
@@ -49,6 +53,15 @@ def create_sampling_metadata(
         temperature = None
     else:
         assert temperature is not None
+
+    if frequency_penalties is None:
+        presence_penalties = None
+        repetition_penalties = None
+        no_penalties = True
+    else:
+        presence_penalties = torch.zeros_like(frequency_penalties)
+        repetition_penalties = torch.ones_like(frequency_penalties)
+        no_penalties = False
 
     return SamplingMetadata(
         temperature=temperature,
@@ -59,12 +72,12 @@ def create_sampling_metadata(
         min_p=torch.empty(1, ),
         generators=generators,
         max_num_logprobs=0,
-        no_penalties=False,
-        prompt_token_ids=None,
-        frequency_penalties=torch.tensor([]),
-        presence_penalties=torch.tensor([]),
-        repetition_penalties=torch.tensor([]),
-        output_token_ids=[],
+        no_penalties=no_penalties,
+        prompt_token_ids=prompt_token_ids,
+        frequency_penalties=frequency_penalties,
+        presence_penalties=presence_penalties,
+        repetition_penalties=repetition_penalties,
+        output_token_ids=output_token_ids,
         min_tokens={},
         logit_bias=[None],
         allowed_token_ids_mask=None,
@@ -520,6 +533,63 @@ def _test_masked_logits(
         assert token_id in unmasked_indices[i]
 
 
+@pytest.mark.parametrize("frequency_penalty", [-1.0, 1.0])
+def test_frequency_penalty(rejection_sampler, frequency_penalty):
+    """Test rejection sampling with frequency_penalty sampling"""
+    vocab_size = 100
+    batch_size = 8
+    num_draft_tokens = 3
+    num_tokens = batch_size * num_draft_tokens
+
+    # Create logits with the uniform distribution.
+    target_logits = torch.zeros((num_tokens, vocab_size), device=DEVICE)
+
+    # Create sampling metadata
+    output_token_ids, sorted_token_ids_in_output = \
+        create_weighted_output_token_list(
+            batch_size,
+            vocab_size,
+        )
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(batch_size, dtype=torch.float32, device=DEVICE),
+        frequency_penalties=torch.tensor(
+            [frequency_penalty] * batch_size,
+            device=DEVICE,
+            dtype=torch.float32,
+        ),
+        prompt_token_ids=torch.zeros(
+            (batch_size, 0),
+            device=DEVICE,
+            dtype=torch.int64,
+        ),
+        output_token_ids=output_token_ids,
+    )
+
+    unmasked_indices = []
+    if frequency_penalty > 0:
+        for i in range(batch_size):
+            for _ in range(num_draft_tokens):
+                unmasked_indices.append([
+                    id for id in range(vocab_size)
+                    if id not in sorted_token_ids_in_output[i]
+                ])
+    elif frequency_penalty < 0:
+        for i in range(batch_size):
+            for _ in range(num_draft_tokens):
+                unmasked_indices.append(sorted_token_ids_in_output[i])
+
+    _test_masked_logits(
+        rejection_sampler,
+        batch_size=batch_size,
+        num_draft_tokens=num_draft_tokens,
+        vocab_size=vocab_size,
+        target_logits=target_logits,
+        unmasked_indices=unmasked_indices,
+        sampling_metadata=sampling_metadata,
+    )
+
+
 @pytest.mark.parametrize("top_k", [1, 5, 99])
 def test_top_k(rejection_sampler, top_k):
     """Test rejection sampling with top-k sampling"""
@@ -606,41 +676,5 @@ def test_top_p(rejection_sampler, top_p):
         vocab_size=vocab_size,
         target_logits=target_logits,
         unmasked_indices=top_p_indices,
-        sampling_metadata=sampling_metadata,
-    )
-
-
-@pytest.mark.parametrize("frequency_penalty", [0.05, 0.5])
-def test_frequency_penalty(rejection_sampler, frequency_penalty):
-    """Test rejection sampling with frequency_penalty sampling"""
-    vocab_size = 100
-    batch_size = 100
-    num_draft_tokens = 3
-    num_tokens = batch_size * num_draft_tokens
-
-    # Create logits with the uniform distribution.
-    target_logits = torch.zeros((num_tokens, vocab_size), device=DEVICE)
-
-    # Increment the logits for top-k indices, a little bit more than the other
-    # ones. If the masking is effective, the non-topk indices will never be
-    # sampled despite the small difference in logits.
-    for i in range(num_tokens):
-        target_logits[i, top_k_indices[i]] += 0.1
-
-    # Create sampling metadata
-    temperature = torch.ones(batch_size, dtype=torch.float32, device=DEVICE)
-    sampling_metadata = create_sampling_metadata(
-        all_greedy=False,
-        temperature=temperature,
-        top_k=torch.tensor([top_k] * batch_size, device=DEVICE, dtype=torch.int64),
-    )
-
-    _test_masked_logits(
-        rejection_sampler,
-        batch_size=batch_size,
-        num_draft_tokens=num_draft_tokens,
-        vocab_size=vocab_size,
-        target_logits=target_logits,
-        unmasked_indices=top_k_indices,
         sampling_metadata=sampling_metadata,
     )
