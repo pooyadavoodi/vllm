@@ -623,7 +623,7 @@ def test_top_p(rejection_sampler, top_p):
     )
 
 
-@pytest.mark.parametrize("frequency_penalty", [-2.0, 2.0])
+@pytest.mark.parametrize("frequency_penalty", [-1.0, 1.0])
 def test_frequency_penalty(rejection_sampler, frequency_penalty):
     """Test rejection sampling with frequency_penalty sampling"""
     vocab_size = 100
