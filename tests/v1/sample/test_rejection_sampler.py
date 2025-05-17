@@ -533,7 +533,7 @@ def _test_masked_logits(
         assert token_id in unmasked_indices[i]
 
 
-@pytest.mark.parametrize("frequency_penalty", [-1.0, 1.0])
+@pytest.mark.parametrize("frequency_penalty", [-2.0, 2.0])
 def test_frequency_penalty(rejection_sampler, frequency_penalty):
     """Test rejection sampling with frequency_penalty sampling"""
     vocab_size = 100
@@ -549,7 +549,10 @@ def test_frequency_penalty(rejection_sampler, frequency_penalty):
         create_weighted_output_token_list(
             batch_size,
             vocab_size,
-        )
+        # Increase the minimum frequency to ensure that
+        # the sampled tokens are not from the penalized tokens.
+        min_freq=10,
+    )
     sampling_metadata = create_sampling_metadata(
         all_greedy=False,
         temperature=torch.ones(batch_size, dtype=torch.float32, device=DEVICE),
@@ -559,7 +562,7 @@ def test_frequency_penalty(rejection_sampler, frequency_penalty):
             dtype=torch.float32,
         ),
         prompt_token_ids=torch.zeros(
-            (batch_size, 0),
+            (batch_size, 1),
             device=DEVICE,
             dtype=torch.int64,
         ),
