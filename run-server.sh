@@ -14,15 +14,17 @@ export VLLM_USE_V1=1
 #         --port 8000 \
 #         -tp 4
 
-    # -Xfrozen_modules=off \
-    # -m debugpy --listen 5679 --wait-for-client \
-    # --enforce-eager \
+
 
 python \
+    -Xfrozen_modules=off \
+    -m debugpy --listen 5677 --wait-for-client \
     -m vllm.entrypoints.openai.api_server \
-    --model "meta-llama/Meta-Llama-3-8B-Instruct" \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
     --speculative-config '{ "method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4 }' \
-    
+    --tensor-parallel-size 1 \
+    --enforce-eager \
+
 # export CUDA_VISIBLE_DEVICES=3
 # export VLLM_DISAGG_PREFILL_ROLE="decode"
 # python3 -m vllm.entrypoints.openai.api_server \
