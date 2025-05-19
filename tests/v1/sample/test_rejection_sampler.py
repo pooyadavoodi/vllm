@@ -640,7 +640,6 @@ def test_frequency_penalty(rejection_sampler, frequency_penalty):
     num_draft_tokens = 3
     num_tokens = batch_size * num_draft_tokens
 
-    # Create logits with the uniform distribution.
     target_logits = torch.zeros((num_tokens, vocab_size), device=DEVICE)
 
     # Create sampling metadata
@@ -701,7 +700,6 @@ def test_presence_penalty(rejection_sampler, presence_penalty):
     num_draft_tokens = 3
     num_tokens = batch_size * num_draft_tokens
 
-    # Create logits with the uniform distribution.
     target_logits = torch.zeros((num_tokens, vocab_size), device=DEVICE)
 
     # Create sampling metadata
@@ -733,6 +731,60 @@ def test_presence_penalty(rejection_sampler, presence_penalty):
                     if id not in sorted_token_ids_in_output[i]
                 ])
     elif presence_penalty < 0:
+        for i in range(batch_size):
+            for _ in range(num_draft_tokens):
+                unmasked_indices.append(sorted_token_ids_in_output[i])
+
+    _test_masked_logits(
+        rejection_sampler,
+        batch_size=batch_size,
+        num_draft_tokens=num_draft_tokens,
+        vocab_size=vocab_size,
+        target_logits=target_logits,
+        unmasked_indices=unmasked_indices,
+        sampling_metadata=sampling_metadata,
+    )
+
+
+@pytest.mark.parametrize("repetition_penalty", [0.1, 10.0])
+def test_repetition_penalty(rejection_sampler, repetition_penalty):
+    """Test rejection sampling with repetition_penalty sampling"""
+    vocab_size = 100
+    batch_size = 8
+    num_draft_tokens = 3
+    num_tokens = batch_size * num_draft_tokens
+
+    target_logits = torch.ones((num_tokens, vocab_size), device=DEVICE) + 100.0
+
+    # Create sampling metadata
+    output_token_ids, sorted_token_ids_in_output = \
+        create_weighted_output_token_list(batch_size, vocab_size)
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(batch_size, dtype=torch.float32, device=DEVICE),
+        repetition_penalties=torch.tensor(
+            [repetition_penalty] * batch_size,
+            device=DEVICE,
+            dtype=torch.float32,
+        ),
+        prompt_token_ids=torch.zeros(
+            (batch_size, 0),
+            device=DEVICE,
+            dtype=torch.int64,
+        ),
+        output_token_ids=output_token_ids,
+        batch_size=batch_size,
+    )
+
+    unmasked_indices = []
+    if repetition_penalty > 1.0:
+        for i in range(batch_size):
+            for _ in range(num_draft_tokens):
+                unmasked_indices.append([
+                    id for id in range(vocab_size)
+                    if id not in sorted_token_ids_in_output[i]
+                ])
+    elif repetition_penalty < 1.0:
         for i in range(batch_size):
             for _ in range(num_draft_tokens):
                 unmasked_indices.append(sorted_token_ids_in_output[i])
