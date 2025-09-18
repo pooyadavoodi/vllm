@@ -1638,6 +1638,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         seq = sorted(scheduler_output.structured_output_request_ids.items(),
                      key=lambda x: x[1])
         for req_id, _ in seq:
+            # Check if the request ID exists in our batch indices mapping
+            if req_id not in struct_out_req_batch_indices:
+                logger.warning(
+                    "Request ID {req_id} not found in structured output batch "
+                    "indices. This may indicate a mismatch between scheduler "
+                    "output and current batch. Available request IDs: ",
+                    list(struct_out_req_batch_indices.keys()),
+                )
+                # Skip this request but still advance the cumulative_index
+                # to maintain alignment with the bitmask
+                num_spec_tokens = len(
+                    scheduler_output.scheduled_spec_decode_tokens.get(
+                        req_id, []))
+                cumulative_index += 1 + num_spec_tokens
+                continue
+
             logit_index = struct_out_req_batch_indices[req_id]
             num_spec_tokens = len(
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
