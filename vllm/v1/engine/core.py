@@ -107,18 +107,7 @@ class EngineCore:
         self.log_stats = log_stats
 
         # Setup Model.
-        stage_start = time.monotonic()
-        logger.info(
-            "EngineCore[%d] init: constructing model executor %s.",
-            vllm_config.parallel_config.data_parallel_rank,
-            executor_class.__name__,
-        )
         self.model_executor = executor_class(vllm_config)
-        logger.info(
-            "EngineCore[%d] init: model executor constructed in %.2fs.",
-            vllm_config.parallel_config.data_parallel_rank,
-            time.monotonic() - stage_start,
-        )
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
@@ -128,33 +117,13 @@ class EngineCore:
             self._eep_scale_up_before_kv_init()
 
         # Setup KV Caches and update CacheConfig after profiling.
-        stage_start = time.monotonic()
-        logger.info(
-            "EngineCore[%d] init: initializing KV caches/profile.",
-            vllm_config.parallel_config.data_parallel_rank,
-        )
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
-        )
-        logger.info(
-            "EngineCore[%d] init: KV cache/profile initialized in %.2fs.",
-            vllm_config.parallel_config.data_parallel_rank,
-            time.monotonic() - stage_start,
         )
 
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
-        stage_start = time.monotonic()
-        logger.info(
-            "EngineCore[%d] init: broadcasting initialize_cache to workers.",
-            vllm_config.parallel_config.data_parallel_rank,
-        )
         self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
-        logger.info(
-            "EngineCore[%d] init: initialize_cache RPC completed in %.2fs.",
-            vllm_config.parallel_config.data_parallel_rank,
-            time.monotonic() - stage_start,
-        )
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -264,17 +233,9 @@ class EngineCore:
         self, vllm_config: VllmConfig
     ) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
-        dp_rank = vllm_config.parallel_config.data_parallel_rank
 
         # Get all kv cache needed by the model
-        stage_start = time.monotonic()
-        logger.info("EngineCore[%d] KV init: fetching KV cache specs.", dp_rank)
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
-        logger.info(
-            "EngineCore[%d] KV init: fetched KV cache specs in %.2fs.",
-            dp_rank,
-            time.monotonic() - stage_start,
-        )
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
@@ -288,18 +249,8 @@ class EngineCore:
             else:
                 # Profiles the peak memory usage of the model to determine how
                 # much memory can be allocated for kv cache.
-                stage_start = time.monotonic()
-                logger.info(
-                    "EngineCore[%d] KV init: profiling available GPU memory.",
-                    dp_rank,
-                )
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
-                logger.info(
-                    "EngineCore[%d] KV init: profiled available GPU memory in %.2fs.",
-                    dp_rank,
-                    time.monotonic() - stage_start,
-                )
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
@@ -309,15 +260,8 @@ class EngineCore:
         # Track max_model_len before KV cache config to detect auto-fit changes
         max_model_len_before = vllm_config.model_config.max_model_len
 
-        stage_start = time.monotonic()
-        logger.info("EngineCore[%d] KV init: building KV cache configs.", dp_rank)
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
-        )
-        logger.info(
-            "EngineCore[%d] KV init: built KV cache configs in %.2fs.",
-            dp_rank,
-            time.monotonic() - stage_start,
         )
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
@@ -332,17 +276,7 @@ class EngineCore:
         num_cpu_blocks = 0
 
         # Initialize kv cache and warmup the execution
-        stage_start = time.monotonic()
-        logger.info(
-            "EngineCore[%d] KV init: initializing caches and warming up model.",
-            dp_rank,
-        )
         self.model_executor.initialize_from_config(kv_cache_configs)
-        logger.info(
-            "EngineCore[%d] KV init: caches/warmup completed in %.2fs.",
-            dp_rank,
-            time.monotonic() - stage_start,
-        )
 
         elapsed = time.time() - start
         logger.info_once(
@@ -868,11 +802,6 @@ class EngineCoreProc(EngineCore):
             vllm_config,
             client_handshake_address,
         ) as addresses:
-            init_stage_start = time.monotonic()
-            logger.info(
-                "EngineCoreProc[%d] startup: handshake complete, beginning core init.",
-                self.engine_index,
-            )
             self.client_count = len(addresses.outputs)
 
             # Set up data parallel environment.
@@ -900,35 +829,14 @@ class EngineCoreProc(EngineCore):
                     EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
                     vllm_config=vllm_config,
                 )
-            stage_start = time.monotonic()
-            logger.info(
-                "EngineCoreProc[%d] startup: initializing data parallel state.",
-                self.engine_index,
-            )
             self._init_data_parallel(vllm_config)
-            logger.info(
-                "EngineCoreProc[%d] startup: data parallel state initialized "
-                "in %.2fs.",
-                self.engine_index,
-                time.monotonic() - stage_start,
-            )
 
-            stage_start = time.monotonic()
-            logger.info(
-                "EngineCoreProc[%d] startup: initializing EngineCore.",
-                self.engine_index,
-            )
             super().__init__(
                 vllm_config,
                 executor_class,
                 log_stats,
                 executor_fail_callback,
                 internal_dp_balancing,
-            )
-            logger.info(
-                "EngineCoreProc[%d] startup: EngineCore initialized in %.2fs.",
-                self.engine_index,
-                time.monotonic() - stage_start,
             )
 
             # Background Threads and Queues for IO. These enable us to
@@ -962,22 +870,11 @@ class EngineCoreProc(EngineCore):
 
             # Don't complete handshake until DP coordinator ready message is
             # received.
-            logger.info(
-                "EngineCoreProc[%d] startup: waiting for coordinator/input "
-                "thread readiness before READY handshake.",
-                self.engine_index,
-            )
             while not ready_event.wait(timeout=10):
                 if not input_thread.is_alive():
                     raise RuntimeError("Input socket thread died during startup")
                 assert addresses.coordinator_input is not None
                 logger.info("Waiting for READY message from DP Coordinator...")
-            logger.info(
-                "EngineCoreProc[%d] startup: initialization complete in %.2fs; "
-                "sending READY handshake.",
-                self.engine_index,
-                time.monotonic() - init_stage_start,
-            )
 
     @contextmanager
     def _perform_handshakes(
@@ -1083,10 +980,6 @@ class EngineCoreProc(EngineCore):
                     vllm_config.parallel_config.compute_hash()
                 )
 
-            logger.info(
-                "EngineCoreProc[%d] sending READY to front-end.",
-                int.from_bytes(identity, "little"),
-            )
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
     @staticmethod

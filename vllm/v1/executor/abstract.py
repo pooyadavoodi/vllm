@@ -114,21 +114,8 @@ class Executor(ABC):
         Initialize the KV caches and begin the model execution loop of the
         underlying workers.
         """
-        stage_start = time.monotonic()
-        logger.info("Executor init_from_config: sending initialize_from_config RPC.")
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
-        logger.info(
-            "Executor init_from_config: initialize_from_config RPC completed in %.2fs.",
-            time.monotonic() - stage_start,
-        )
-        stage_start = time.monotonic()
-        logger.info("Executor init_from_config: sending compile_or_warm_up_model RPC.")
         compilation_times: list[float] = self.collective_rpc("compile_or_warm_up_model")
-        logger.info(
-            "Executor init_from_config: compile_or_warm_up_model RPC completed "
-            "in %.2fs.",
-            time.monotonic() - stage_start,
-        )
         # Propagate compilation time from workers back to the main process.
         # With TP>1, compilation happens in worker processes, so the main
         # process config is never updated. Use max across workers since they

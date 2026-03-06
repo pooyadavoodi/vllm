@@ -7,7 +7,6 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from datetime import timedelta
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -366,12 +365,7 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
-            logger.info("Worker rank %d memory profile: starting profile_run.", self.rank)
             self.model_runner.profile_run()
-            logger.info(
-                "Worker rank %d memory profile: profile_run completed.",
-                self.rank,
-            )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -394,12 +388,7 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            logger.info("Worker rank %d memory profile: starting profile_run.", self.rank)
             self.model_runner.profile_run()
-            logger.info(
-                "Worker rank %d memory profile: profile_run completed.",
-                self.rank,
-            )
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
@@ -1023,70 +1012,18 @@ def init_worker_distributed_environment(
                         physical_device_ids,
                     )
 
-    timeout_s = os.getenv("VLLM_DISTRIBUTED_INIT_TIMEOUT_S")
-    init_timeout = None
-    if timeout_s:
-        try:
-            timeout_value = int(timeout_s)
-            if timeout_value > 0:
-                init_timeout = timedelta(seconds=timeout_value)
-            else:
-                logger.warning(
-                    "Ignoring non-positive VLLM_DISTRIBUTED_INIT_TIMEOUT_S=%s",
-                    timeout_s,
-                )
-        except ValueError:
-            logger.warning(
-                "Ignoring invalid VLLM_DISTRIBUTED_INIT_TIMEOUT_S=%s", timeout_s
-            )
-
-    init_method = distributed_init_method or "env://"
-    init_start = time.monotonic()
-    logger.info(
-        "Initializing distributed environment (rank=%d, local_rank=%d, "
-        "world_size=%d, backend=%s, init_method=%s, timeout_s=%s, "
-        "NCCL_P2P_DISABLE=%s, NCCL_P2P_LEVEL=%s, NCCL_IB_DISABLE=%s, "
-        "NCCL_SOCKET_IFNAME=%s, "
-        "VLLM_ALLREDUCE_USE_SYMM_MEM=%s, VLLM_DISABLE_PYNCCL=%s)",
-        rank,
-        local_rank,
-        parallel_config.world_size,
-        backend,
-        init_method,
-        timeout_s,
-        os.getenv("NCCL_P2P_DISABLE", "<unset>"),
-        os.getenv("NCCL_P2P_LEVEL", "<unset>"),
-        os.getenv("NCCL_IB_DISABLE", "<unset>"),
-        os.getenv("NCCL_SOCKET_IFNAME", "<unset>"),
-        os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "<unset>"),
-        os.getenv("VLLM_DISABLE_PYNCCL", "<unset>"),
-    )
     init_distributed_environment(
         parallel_config.world_size,
         rank,
-        init_method,
+        distributed_init_method or "env://",
         local_rank,
         backend,
-        timeout=init_timeout,
     )
-    logger.info(
-        "Initialized distributed environment for rank=%d in %.2fs",
-        rank,
-        time.monotonic() - init_start,
-    )
-
-    mp_start = time.monotonic()
-    logger.info("Initializing model parallel groups for rank=%d", rank)
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,
         parallel_config.prefill_context_parallel_size,
         parallel_config.decode_context_parallel_size,
-    )
-    logger.info(
-        "Initialized model parallel groups for rank=%d in %.2fs",
-        rank,
-        time.monotonic() - mp_start,
     )
 
     # Init ec connector here before KV caches caches init
