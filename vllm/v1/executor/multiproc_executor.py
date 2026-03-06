@@ -577,6 +577,8 @@ class WorkerProc:
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
+        stage_start = time.monotonic()
+        logger.info("Worker rank %d init: starting init_worker.", rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
             {} for _ in range(vllm_config.parallel_config.world_size)
@@ -590,6 +592,11 @@ class WorkerProc:
             "shared_worker_lock": shared_worker_lock,
         }
         wrapper.init_worker(all_kwargs)
+        logger.info(
+            "Worker rank %d init: init_worker completed in %.2fs.",
+            rank,
+            time.monotonic() - stage_start,
+        )
         self.worker = wrapper
 
         scheduler_config = vllm_config.scheduler_config
@@ -608,15 +615,36 @@ class WorkerProc:
         )
 
         # Load model
+        stage_start = time.monotonic()
+        logger.info("Worker rank %d init: initializing message queues.", rank)
         self._init_message_queues(input_shm_handle, vllm_config)
+        logger.info(
+            "Worker rank %d init: message queues initialized in %.2fs.",
+            rank,
+            time.monotonic() - stage_start,
+        )
         is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
         if not is_eep_new_worker:
+            stage_start = time.monotonic()
+            logger.info("Worker rank %d init: calling init_device.", rank)
             self.worker.init_device()
+            logger.info(
+                "Worker rank %d init: init_device completed in %.2fs.",
+                rank,
+                time.monotonic() - stage_start,
+            )
             # Update process title now that parallel groups are initialized
             self.setup_proc_title_and_log_prefix(
                 enable_ep=vllm_config.parallel_config.enable_expert_parallel
             )
+            stage_start = time.monotonic()
+            logger.info("Worker rank %d init: calling load_model.", rank)
             self.worker.load_model()
+            logger.info(
+                "Worker rank %d init: load_model completed in %.2fs.",
+                rank,
+                time.monotonic() - stage_start,
+            )
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -703,8 +731,89 @@ class WorkerProc:
         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
             unready_proc_handles
         )
+        wait_start = time.monotonic()
+        last_dump_elapsed = 0.0
+        stack_dump_period_s: float | None = None
+        stack_dump_period_env = os.getenv("VLLM_WORKER_INIT_STACK_DUMP_PERIOD_S")
+        if stack_dump_period_env:
+            try:
+                parsed = float(stack_dump_period_env)
+                if parsed > 0:
+                    stack_dump_period_s = parsed
+                else:
+                    logger.warning(
+                        "Ignoring non-positive VLLM_WORKER_INIT_STACK_DUMP_PERIOD_S=%s",
+                        stack_dump_period_env,
+                    )
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid VLLM_WORKER_INIT_STACK_DUMP_PERIOD_S=%s",
+                    stack_dump_period_env,
+                )
+        timeout_s: float | None = None
+        timeout_s_env = os.getenv("VLLM_WORKER_INIT_TIMEOUT_S")
+        if timeout_s_env:
+            try:
+                parsed = float(timeout_s_env)
+                if parsed > 0:
+                    timeout_s = parsed
+                else:
+                    logger.warning(
+                        "Ignoring non-positive VLLM_WORKER_INIT_TIMEOUT_S=%s",
+                        timeout_s_env,
+                    )
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid VLLM_WORKER_INIT_TIMEOUT_S=%s", timeout_s_env
+                )
+
         while pipes:
-            ready = multiprocessing.connection.wait(pipes.keys())
+            ready = multiprocessing.connection.wait(pipes.keys(), timeout=10.0)
+            if not ready:
+                pending = sorted(handle.rank for handle in pipes.values())
+                pending_pids = sorted(
+                    handle.proc.pid for handle in pipes.values() if handle.proc.pid is not None
+                )
+                elapsed = time.monotonic() - wait_start
+                logger.info(
+                    "Waiting for worker process(es) to become READY. "
+                    "Pending ranks=%s pids=%s elapsed=%.1fs.",
+                    pending,
+                    pending_pids,
+                    elapsed,
+                )
+                if (
+                    stack_dump_period_s is not None
+                    and elapsed - last_dump_elapsed >= stack_dump_period_s
+                ):
+                    last_dump_elapsed = elapsed
+                    for handle in pipes.values():
+                        if handle.proc.pid is None:
+                            continue
+                        try:
+                            os.kill(handle.proc.pid, signal.SIGUSR1)
+                        except ProcessLookupError:
+                            logger.warning(
+                                "Cannot request stack dump: worker rank %d pid %s "
+                                "already exited.",
+                                handle.rank,
+                                handle.proc.pid,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed requesting stack dump for worker rank %d "
+                                "(pid %s): %s",
+                                handle.rank,
+                                handle.proc.pid,
+                                e,
+                            )
+                if timeout_s is not None and elapsed > timeout_s:
+                    raise TimeoutError(
+                        "Timed out waiting for worker process(es) to become READY "
+                        f"after {elapsed:.1f}s. Pending ranks={pending}. "
+                        "Increase timeout with VLLM_WORKER_INIT_TIMEOUT_S if needed."
+                    )
+                continue
             for pipe in ready:
                 assert isinstance(pipe, Connection)
                 try:
@@ -802,6 +911,13 @@ class WorkerProc:
                 logger.warning("Exception closing inherited connection: %s", e)
 
         try:
+            if os.getenv("VLLM_WORKER_INIT_STACK_DUMP_PERIOD_S"):
+                import faulthandler
+
+                # Allow parent process to trigger stack dumps via SIGUSR1 while
+                # worker is blocked during startup.
+                faulthandler.register(signal.SIGUSR1, all_threads=True)
+
             # Initialize tracer
             rank = kwargs.get("rank", 0)
             maybe_init_worker_tracer(
@@ -810,7 +926,9 @@ class WorkerProc:
                 process_name=f"Worker_{rank}",
             )
 
+            logger.info("Worker rank %d main: entering WorkerProc constructor.", rank)
             worker = WorkerProc(*args, **kwargs)
+            logger.info("Worker rank %d main: WorkerProc constructed.", rank)
             assert worker.worker_response_mq is not None
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)

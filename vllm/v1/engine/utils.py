@@ -991,15 +991,42 @@ def wait_for_engine_startup(
     while any(conn_pending) or any(start_pending):
         events = poller.poll(STARTUP_POLL_PERIOD_MS)
         if not events:
+            # Include engine indexes by state to make startup hangs diagnosable.
+            local_conn_ids = [
+                int.from_bytes(engine.identity, "little")
+                for engine in core_engines
+                if engine.local and engine.state == CoreEngineState.NEW
+            ]
+            remote_conn_ids = [
+                int.from_bytes(engine.identity, "little")
+                for engine in core_engines
+                if (not engine.local) and engine.state == CoreEngineState.NEW
+            ]
+            local_start_ids = [
+                int.from_bytes(engine.identity, "little")
+                for engine in core_engines
+                if engine.local and engine.state == CoreEngineState.CONNECTED
+            ]
+            remote_start_ids = [
+                int.from_bytes(engine.identity, "little")
+                for engine in core_engines
+                if (not engine.local) and engine.state == CoreEngineState.CONNECTED
+            ]
             if any(conn_pending):
                 logger.debug(
-                    "Waiting for %d local, %d remote core engine proc(s) to connect.",
+                    "Waiting for %d local, %d remote core engine proc(s) to connect. "
+                    "Pending local ids=%s, remote ids=%s.",
                     *conn_pending,
+                    local_conn_ids,
+                    remote_conn_ids,
                 )
             if any(start_pending):
                 logger.debug(
-                    "Waiting for %d local, %d remote core engine proc(s) to start.",
+                    "Waiting for %d local, %d remote core engine proc(s) to start. "
+                    "Connected-not-ready local ids=%s, remote ids=%s.",
                     *start_pending,
+                    local_start_ids,
+                    remote_start_ids,
                 )
             continue
         if len(events) > 1 or events[0][0] != handshake_socket:

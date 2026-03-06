@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
+import os
+import time
 import torch
 from torch.distributed import ProcessGroup
 
@@ -15,6 +16,7 @@ from vllm.distributed.device_communicators.pynccl_allocator import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import cuda_device_count_stateless
 
 from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
@@ -57,6 +59,41 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
 
+        risky_p2p_topology = False
+        topology_ids: list[int] = []
+        if (
+            current_platform.is_cuda_alike()
+            and self.world_size > 2
+            and os.environ.get("NCCL_P2P_DISABLE") == "0"
+        ):
+            cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
+            if cuda_visible_devices:
+                try:
+                    topology_ids = [int(i) for i in cuda_visible_devices.split(",")]
+                except ValueError:
+                    topology_ids = []
+            else:
+                topology_ids = list(range(cuda_device_count_stateless()))
+            topology_ids = topology_ids[: self.world_size]
+            risky_p2p_topology = (
+                len(topology_ids) == self.world_size
+                and not current_platform.is_fully_connected(topology_ids)
+            )
+
+        if (
+            self.use_torch_symm_mem
+            and risky_p2p_topology
+            and "VLLM_ALLREDUCE_USE_SYMM_MEM" not in os.environ
+        ):
+            self.use_torch_symm_mem = False
+            logger.warning(
+                "Disabling symmetric-memory allreduce on non-fully-connected "
+                "CUDA topology (%s) with NCCL_P2P_DISABLE=0. This avoids "
+                "known warmup-time hangs in NCCL communicator bring-up. "
+                "Set VLLM_ALLREDUCE_USE_SYMM_MEM=1 to force-enable.",
+                topology_ids,
+            )
+
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
@@ -72,11 +109,36 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
-                device=self.device,
-            )
-            if is_symmetric_memory_enabled():
+            disable_pynccl = envs.VLLM_DISABLE_PYNCCL
+            if (
+                not disable_pynccl
+                and "VLLM_DISABLE_PYNCCL" not in os.environ
+                and risky_p2p_topology
+            ):
+                disable_pynccl = True
+                logger.warning(
+                    "Disabling PyNccl communicator for world_size=%d on "
+                    "non-fully-connected CUDA topology (%s) with "
+                    "NCCL_P2P_DISABLE=0. This avoids known startup hangs in "
+                    "PyNccl warmup collectives. Set VLLM_DISABLE_PYNCCL=0 to "
+                    "force-enable PyNccl.",
+                    self.world_size,
+                    topology_ids,
+                )
+
+            if disable_pynccl:
+                logger.info_once(
+                    "PyNccl communicator is disabled (VLLM_DISABLE_PYNCCL=%s). "
+                    "Using alternative communicator paths.",
+                    int(disable_pynccl),
+                    scope="local",
+                )
+            else:
+                self.pynccl_comm = PyNcclCommunicator(
+                    group=self.cpu_group if tcp_store_group is None else tcp_store_group,
+                    device=self.device,
+                )
+            if self.pynccl_comm is not None and is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
@@ -84,7 +146,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
-        if use_torch_symm_mem and current_platform.is_cuda():
+        if self.use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -96,7 +158,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if use_custom_allreduce and self.world_size > 1:
+        if self.use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
@@ -159,6 +221,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
     def all_reduce(self, input_):
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        trace_collectives_sync = os.environ.get("VLLM_TRACE_COLLECTIVES_SYNC") == "1"
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_reduce begin "
+                "shape=%s dtype=%s device=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input_.shape),
+                input_.dtype,
+                input_.device,
+            )
+            op_start = time.monotonic()
+
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -166,6 +243,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
+                if trace_collectives:
+                    logger.info(
+                        "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                        "path=symm_with_copy elapsed=%.3fs out_shape=%s",
+                        self.unique_name,
+                        self.rank_in_group,
+                        self.world_size,
+                        time.monotonic() - op_start,
+                        tuple(out.shape),
+                    )
                 return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -177,6 +264,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                    "path=quick_reduce elapsed=%.3fs out_shape=%s",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    tuple(out.shape),
+                )
             return out
         fi_ar_comm = self.fi_ar_comm
         if (
@@ -186,6 +283,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = fi_ar_comm.all_reduce(input_)
             assert out is not None
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                    "path=flashinfer elapsed=%.3fs out_shape=%s",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    tuple(out.shape),
+                )
             return out
         ca_comm = self.ca_comm
         if (
@@ -195,16 +302,73 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                    "path=custom_allreduce elapsed=%.3fs out_shape=%s",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    tuple(out.shape),
+                )
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                    "path=torch_symm_mem elapsed=%.3fs out_shape=%s",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    tuple(out.shape),
+                )
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce path=torch_dist "
+                    "group=%s (calling torch.distributed.all_reduce)",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    type(self.device_group).__name__,
+                )
             torch.distributed.all_reduce(out, group=self.device_group)
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                    "path=torch_dist elapsed=%.3fs out_shape=%s",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    tuple(out.shape),
+                )
+            if trace_collectives_sync:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce "
+                    "post_sync begin path=torch_dist",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                )
+                sync_start = time.monotonic()
+                torch.cuda.current_stream(device=out.device).synchronize()
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce "
+                    "post_sync end path=torch_dist elapsed=%.3fs",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - sync_start,
+                )
             return out
         assert pynccl_comm is not None
         out = pynccl_comm.all_reduce(input_)
@@ -215,9 +379,108 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # group, where we always have either custom allreduce or pynccl.
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                    "path=pynccl_fallback_torch_dist elapsed=%.3fs out_shape=%s",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    tuple(out.shape),
+                )
+            if trace_collectives_sync:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce "
+                    "post_sync begin path=pynccl_fallback_torch_dist",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                )
+                sync_start = time.monotonic()
+                torch.cuda.current_stream(device=out.device).synchronize()
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_reduce "
+                    "post_sync end path=pynccl_fallback_torch_dist elapsed=%.3fs",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - sync_start,
+                )
+            return out
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_reduce end "
+                "path=pynccl elapsed=%.3fs out_shape=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - op_start,
+                tuple(out.shape),
+            )
+        if trace_collectives_sync:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_reduce "
+                "post_sync begin path=pynccl",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+            )
+            sync_start = time.monotonic()
+            torch.cuda.current_stream(device=out.device).synchronize()
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_reduce "
+                "post_sync end path=pynccl elapsed=%.3fs",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - sync_start,
+            )
+        return out
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_gather begin "
+                "shape=%s dtype=%s device=%s dim=%d",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input_.shape),
+                input_.dtype,
+                input_.device,
+                dim,
+            )
+            op_start = time.monotonic()
+        out = super().all_gather(input_, dim)
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_gather end "
+                "elapsed=%.3fs out_shape=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - op_start,
+                tuple(out.shape),
+            )
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] reduce_scatter begin "
+                "shape=%s dtype=%s device=%s dim=%d",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input_.shape),
+                input_.dtype,
+                input_.device,
+                dim,
+            )
+            op_start = time.monotonic()
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -240,11 +503,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pynccl_comm.reduce_scatter(output, input_tensor)
 
         # Reshape before returning
-        return output.movedim(0, dim).contiguous()
+        out = output.movedim(0, dim).contiguous()
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] reduce_scatter end "
+                "elapsed=%.3fs out_shape=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - op_start,
+                tuple(out.shape),
+            )
+        return out
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] reduce_scatterv begin "
+                "shape=%s dtype=%s device=%s dim=%d sizes=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                tuple(input_.shape),
+                input_.dtype,
+                input_.device,
+                dim,
+                sizes,
+            )
+            op_start = time.monotonic()
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -275,19 +564,53 @@ class CudaCommunicator(DeviceCommunicatorBase):
             pynccl_comm.reduce_scatter(output, input_tensor)
 
         # Reshape before returning
-        return output.movedim(0, dim).contiguous()
+        out = output.movedim(0, dim).contiguous()
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] reduce_scatterv end "
+                "elapsed=%.3fs out_shape=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - op_start,
+                tuple(out.shape),
+            )
+        return out
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] send begin "
+                "shape=%s dtype=%s device=%s dst=%d",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                tuple(tensor.shape),
+                tensor.dtype,
+                tensor.device,
+                dst,
+            )
+            op_start = time.monotonic()
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
         else:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] send end elapsed=%.3fs dst=%d",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - op_start,
+                dst,
+            )
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
@@ -296,6 +619,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """NOTE: `src` is the local rank of the source rank."""
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] recv begin "
+                "size=%s dtype=%s src=%d",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                tuple(size),
+                dtype,
+                src,
+            )
+            op_start = time.monotonic()
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
         pynccl_comm = self.pynccl_comm
@@ -303,16 +639,51 @@ class CudaCommunicator(DeviceCommunicatorBase):
             pynccl_comm.recv(tensor, src)
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] recv end "
+                "elapsed=%.3fs shape=%s src=%d",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - op_start,
+                tuple(tensor.shape),
+                src,
+            )
         return tensor
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
             return tensor
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] broadcast begin "
+                "shape=%s dtype=%s device=%s src=%d",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                tuple(tensor.shape),
+                tensor.dtype,
+                tensor.device,
+                src,
+            )
+            op_start = time.monotonic()
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.broadcast(tensor, src)
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] broadcast end "
+                    "elapsed=%.3fs src=%d",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    src,
+                )
             return tensor
         else:
             raise ValueError("No PyNCCL communicator found")
@@ -335,6 +706,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        trace_collectives = os.environ.get("VLLM_TRACE_COLLECTIVES") == "1"
+        if trace_collectives:
+            if isinstance(input_, torch.Tensor):
+                in_shape = tuple(input_.shape)
+                in_dtype = input_.dtype
+            else:
+                in_shape = [tuple(t.shape) for t in input_]
+                in_dtype = [t.dtype for t in input_]
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_gatherv begin "
+                "dim=%d sizes=%s input_shape=%s input_dtype=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                dim,
+                sizes,
+                in_shape,
+                in_dtype,
+            )
+            op_start = time.monotonic()
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
         world_size = self.world_size
@@ -367,13 +758,34 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
-            return _all_gather_single(input_, sizes)
+            out = _all_gather_single(input_, sizes)
+            if trace_collectives:
+                logger.info(
+                    "CollectiveTrace[%s rank=%d/%d] all_gatherv end "
+                    "elapsed=%.3fs out_shape=%s",
+                    self.unique_name,
+                    self.rank_in_group,
+                    self.world_size,
+                    time.monotonic() - op_start,
+                    tuple(out.shape),
+                )
+            return out
 
         output_list = []
         pynccl_comm.group_start()
         for inp in input_:
             output_list.append(_all_gather_single(inp, sizes=sizes))
         pynccl_comm.group_end()
+        if trace_collectives:
+            logger.info(
+                "CollectiveTrace[%s rank=%d/%d] all_gatherv end "
+                "elapsed=%.3fs out_shapes=%s",
+                self.unique_name,
+                self.rank_in_group,
+                self.world_size,
+                time.monotonic() - op_start,
+                [tuple(out.shape) for out in output_list],
+            )
 
         return output_list
 

@@ -4760,6 +4760,32 @@ class GPUModelRunner(
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
 
+        if is_profile:
+            try:
+                rank_tag = (
+                    "dp=%d pp=%d tp=%d"
+                    % (
+                        self.parallel_config.data_parallel_rank,
+                        get_pp_group().rank_in_group,
+                        get_tp_group().rank_in_group,
+                    )
+                )
+            except Exception:
+                rank_tag = "dp/pp/tp=<unavailable>"
+            logger.info(
+                "Profile dummy_run[%s]: start "
+                "(num_tokens=%d, force_attention=%s, uniform_decode=%s, "
+                "allow_microbatching=%s, skip_eplb=%s, "
+                "cudagraph_runtime_mode=%s).",
+                rank_tag,
+                num_tokens,
+                force_attention,
+                uniform_decode,
+                allow_microbatching,
+                skip_eplb,
+                cudagraph_runtime_mode,
+            )
+
         assert (
             cudagraph_runtime_mode is None
             or cudagraph_runtime_mode.is_valid_runtime_mode()
@@ -4979,6 +5005,8 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                if is_profile:
+                    logger.info("Profile dummy_run[%s]: entering model forward.", rank_tag)
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -4986,6 +5014,8 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                if is_profile:
+                    logger.info("Profile dummy_run[%s]: model forward returned.", rank_tag)
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -5052,12 +5082,18 @@ class GPUModelRunner(
         # In such cases, we still have to trigger EPLB to make sure
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
+            if is_profile:
+                logger.info("Profile dummy_run[%s]: entering eplb_step.", rank_tag)
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+            if is_profile:
+                logger.info("Profile dummy_run[%s]: eplb_step returned.", rank_tag)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
+        if is_profile:
+            logger.info("Profile dummy_run[%s]: completed.", rank_tag)
         return hidden_states, hidden_states[logit_indices_device]
 
     @torch.inference_mode()
@@ -5226,6 +5262,20 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
+        try:
+            rank_tag = (
+                "dp=%d pp=%d tp=%d"
+                % (
+                    self.parallel_config.data_parallel_rank,
+                    get_pp_group().rank_in_group,
+                    get_tp_group().rank_in_group,
+                )
+            )
+        except Exception:
+            rank_tag = "dp/pp/tp=<unavailable>"
+
+        logger.info("Profile run[%s]: start.", rank_tag)
+
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -5285,20 +5335,29 @@ class GPUModelRunner(
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        logger.info("Profile run[%s]: entering _dummy_run.", rank_tag)
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
+        logger.info("Profile run[%s]: _dummy_run returned.", rank_tag)
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
+                logger.info("Profile run[%s]: entering _dummy_pooler_run.", rank_tag)
                 output = self._dummy_pooler_run(hidden_states)
+                logger.info("Profile run[%s]: _dummy_pooler_run returned.", rank_tag)
             else:
+                logger.info("Profile run[%s]: entering _dummy_sampler_run.", rank_tag)
                 output = self._dummy_sampler_run(last_hidden_states)
+                logger.info("Profile run[%s]: _dummy_sampler_run returned.", rank_tag)
         else:
             output = None
+        logger.info("Profile run[%s]: entering device sync.", rank_tag)
         self._sync_device()
+        logger.info("Profile run[%s]: device sync returned.", rank_tag)
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
+        logger.info("Profile run[%s]: completed.", rank_tag)
 
     @instrument(span_name="Capture model")
     def capture_model(self) -> int:
