@@ -938,6 +938,8 @@ def init_worker_distributed_environment(
     override_envs_for_eplb(parallel_config)
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
+    init_method = distributed_init_method or "env://"
+
     # On PCIe-only topologies with >2 GPUs, force safer NCCL defaults.
     # Default behavior is to disable NCCL P2P for risky topologies.
     # Set VLLM_ALLOW_RISKY_NCCL_P2P=1 to keep NCCL_P2P_DISABLE=0.
@@ -972,53 +974,10 @@ def init_worker_distributed_environment(
                     "Set VLLM_ALLOW_RISKY_NCCL_P2P=1 to keep NCCL_P2P_DISABLE=0.",
                     physical_device_ids,
                 )
-            # If the user explicitly keeps NCCL_P2P_DISABLE=0, also force
-            # additional guardrails to reduce hang likelihood.
-            if os.environ.get("NCCL_P2P_DISABLE") == "0":
-                if "NCCL_P2P_LEVEL" not in os.environ:
-                    os.environ["NCCL_P2P_LEVEL"] = "PIX"
-                    logger.warning(
-                        "Forcing NCCL_P2P_LEVEL=PIX on non-fully-connected CUDA "
-                        "topology (%s) with NCCL_P2P_DISABLE=0 to avoid "
-                        "cross-PCIe-hop P2P hangs while keeping local-switch "
-                        "P2P enabled. Set NCCL_P2P_LEVEL explicitly to override.",
-                        physical_device_ids,
-                    )
-                if "VLLM_ALLREDUCE_USE_SYMM_MEM" not in os.environ:
-                    os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-                    logger.warning(
-                        "Forcing VLLM_ALLREDUCE_USE_SYMM_MEM=0 on "
-                        "non-fully-connected CUDA topology (%s) with "
-                        "NCCL_P2P_DISABLE=0 to avoid profile-run NCCL hangs. "
-                        "Set VLLM_ALLREDUCE_USE_SYMM_MEM explicitly to override.",
-                        physical_device_ids,
-                    )
-                if "VLLM_DISABLE_PYNCCL" not in os.environ:
-                    os.environ["VLLM_DISABLE_PYNCCL"] = "1"
-                    logger.warning(
-                        "Forcing VLLM_DISABLE_PYNCCL=1 on non-fully-connected CUDA "
-                        "topology (%s) with NCCL_P2P_DISABLE=0 to avoid known "
-                        "PyNccl warmup hangs. Set VLLM_DISABLE_PYNCCL explicitly "
-                        "to override.",
-                        physical_device_ids,
-                    )
-                if "NCCL_IB_DISABLE" not in os.environ:
-                    os.environ["NCCL_IB_DISABLE"] = "1"
-                    logger.warning(
-                        "Forcing NCCL_IB_DISABLE=1 on non-fully-connected CUDA "
-                        "topology (%s) with NCCL_P2P_DISABLE=0 because NCCL "
-                        "collectives can hang in profile-run on this setup. "
-                        "Set NCCL_IB_DISABLE explicitly to override.",
-                        physical_device_ids,
-                    )
-
     init_distributed_environment(
-        parallel_config.world_size,
-        rank,
-        distributed_init_method or "env://",
-        local_rank,
-        backend,
+        parallel_config.world_size, rank, init_method, local_rank, backend
     )
+
     ensure_model_parallel_initialized(
         parallel_config.tensor_parallel_size,
         parallel_config.pipeline_parallel_size,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -15,7 +15,6 @@ from vllm.distributed.device_communicators.pynccl_allocator import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import cuda_device_count_stateless
 
 from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
@@ -58,41 +57,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
 
-        risky_p2p_topology = False
-        topology_ids: list[int] = []
-        if (
-            current_platform.is_cuda_alike()
-            and self.world_size > 2
-            and os.environ.get("NCCL_P2P_DISABLE") == "0"
-        ):
-            cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
-            if cuda_visible_devices:
-                try:
-                    topology_ids = [int(i) for i in cuda_visible_devices.split(",")]
-                except ValueError:
-                    topology_ids = []
-            else:
-                topology_ids = list(range(cuda_device_count_stateless()))
-            topology_ids = topology_ids[: self.world_size]
-            risky_p2p_topology = (
-                len(topology_ids) == self.world_size
-                and not current_platform.is_fully_connected(topology_ids)
-            )
-
-        if (
-            self.use_torch_symm_mem
-            and risky_p2p_topology
-            and "VLLM_ALLREDUCE_USE_SYMM_MEM" not in os.environ
-        ):
-            self.use_torch_symm_mem = False
-            logger.warning(
-                "Disabling symmetric-memory allreduce on non-fully-connected "
-                "CUDA topology (%s) with NCCL_P2P_DISABLE=0. This avoids "
-                "known warmup-time hangs in NCCL communicator bring-up. "
-                "Set VLLM_ALLREDUCE_USE_SYMM_MEM=1 to force-enable.",
-                topology_ids,
-            )
-
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
@@ -108,36 +72,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
-            disable_pynccl = envs.VLLM_DISABLE_PYNCCL
-            if (
-                not disable_pynccl
-                and "VLLM_DISABLE_PYNCCL" not in os.environ
-                and risky_p2p_topology
-            ):
-                disable_pynccl = True
-                logger.warning(
-                    "Disabling PyNccl communicator for world_size=%d on "
-                    "non-fully-connected CUDA topology (%s) with "
-                    "NCCL_P2P_DISABLE=0. This avoids known startup hangs in "
-                    "PyNccl warmup collectives. Set VLLM_DISABLE_PYNCCL=0 to "
-                    "force-enable PyNccl.",
-                    self.world_size,
-                    topology_ids,
-                )
-
-            if disable_pynccl:
-                logger.info_once(
-                    "PyNccl communicator is disabled (VLLM_DISABLE_PYNCCL=%s). "
-                    "Using alternative communicator paths.",
-                    int(disable_pynccl),
-                    scope="local",
-                )
-            else:
-                self.pynccl_comm = PyNcclCommunicator(
-                    group=self.cpu_group if tcp_store_group is None else tcp_store_group,
-                    device=self.device,
-                )
-            if self.pynccl_comm is not None and is_symmetric_memory_enabled():
+            self.pynccl_comm = PyNcclCommunicator(
+                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
+                device=self.device,
+            )
+            if is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
@@ -145,7 +84,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
 
-        if self.use_torch_symm_mem and current_platform.is_cuda():
+        if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -157,7 +96,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if self.use_custom_allreduce and self.world_size > 1:
+        if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
@@ -276,11 +215,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # group, where we always have either custom allreduce or pynccl.
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
-            return out
         return out
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        return super().all_gather(input_, dim)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
@@ -305,8 +240,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pynccl_comm.reduce_scatter(output, input_tensor)
 
         # Reshape before returning
-        out = output.movedim(0, dim).contiguous()
-        return out
+        return output.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
@@ -341,14 +275,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             pynccl_comm.reduce_scatter(output, input_tensor)
 
         # Reshape before returning
-        out = output.movedim(0, dim).contiguous()
-        return out
+        return output.movedim(0, dim).contiguous()
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
@@ -362,6 +296,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """NOTE: `src` is the local rank of the source rank."""
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
+
         tensor = torch.empty(size, dtype=dtype, device=self.device)
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -374,6 +309,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
             return tensor
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.broadcast(tensor, src)
