@@ -4,7 +4,6 @@
 
 import gc
 import os
-import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
