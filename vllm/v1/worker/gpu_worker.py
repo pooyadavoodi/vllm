@@ -482,7 +482,7 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> float:
-        warmup_sizes = []
+        warmup_sizes: list[int | str] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
             # warm up sizes that are not in cudagraph capture sizes,
@@ -939,9 +939,8 @@ def init_worker_distributed_environment(
 
     init_method = distributed_init_method or "env://"
 
-    # On PCIe-only topologies with >2 GPUs, force safer NCCL defaults.
-    # Default behavior is to disable NCCL P2P for risky topologies.
-    # Set VLLM_ALLOW_RISKY_NCCL_P2P=1 to keep NCCL_P2P_DISABLE=0.
+    # Set NCCL_P2P_DISABLE=1 on non-fully-connected CUDA topology
+    # to avoid NCCL collective hangs.
     if (
         backend == "nccl"
         and current_platform.is_cuda_alike()
@@ -956,23 +955,20 @@ def init_worker_distributed_environment(
         else:
             physical_device_ids = list(range(cuda_device_count_stateless()))
         physical_device_ids = physical_device_ids[: parallel_config.world_size]
-        risky_topology = (
-            len(physical_device_ids) == parallel_config.world_size
-            and not current_platform.is_fully_connected(physical_device_ids)
-        )
-        if risky_topology:
-            allow_risky_nccl_p2p = os.getenv("VLLM_ALLOW_RISKY_NCCL_P2P") == "1"
-            if (
-                not allow_risky_nccl_p2p
-                and os.environ.get("NCCL_P2P_DISABLE") != "1"
-            ):
-                os.environ["NCCL_P2P_DISABLE"] = "1"
-                logger.warning(
-                    "Forcing NCCL_P2P_DISABLE=1 on non-fully-connected CUDA "
-                    "topology (%s) to avoid NCCL collective hangs in profile-run. "
-                    "Set VLLM_ALLOW_RISKY_NCCL_P2P=1 to keep NCCL_P2P_DISABLE=0.",
-                    physical_device_ids,
-                )
+        is_fully_connected = current_platform.is_fully_connected(physical_device_ids)
+
+        if (
+            os.environ.get("NCCL_P2P_DISABLE") is None
+            and not is_fully_connected
+            and len(physical_device_ids) == parallel_config.world_size
+        ):
+            os.environ["NCCL_P2P_DISABLE"] = "1"
+            logger.warning(
+                "Setting NCCL_P2P_DISABLE=1 on non-fully-connected CUDA "
+                "topology (%s) to avoid NCCL collective hangs. "
+                "Set NCCL_P2P_DISABLE explicitly to override.",
+                physical_device_ids,
+            )
     init_distributed_environment(
         parallel_config.world_size, rank, init_method, local_rank, backend
     )
